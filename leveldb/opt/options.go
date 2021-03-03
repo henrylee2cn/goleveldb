@@ -8,10 +8,11 @@
 package opt
 
 import (
+	"math"
+
 	"github.com/syndtr/goleveldb/leveldb/cache"
 	"github.com/syndtr/goleveldb/leveldb/comparer"
 	"github.com/syndtr/goleveldb/leveldb/filter"
-	"math"
 )
 
 const (
@@ -35,13 +36,11 @@ var (
 	DefaultCompactionTotalSizeMultiplier = 10.0
 	DefaultCompressionType               = SnappyCompression
 	DefaultIteratorSamplingRate          = 1 * MiB
-	DefaultMaxMemCompationLevel          = 2
-	DefaultNumLevel                      = 7
 	DefaultOpenFilesCacher               = LRUCacher
-	DefaultOpenFilesCacheCapacity        = 500
 	DefaultWriteBuffer                   = 4 * MiB
 	DefaultWriteL0PauseTrigger           = 12
 	DefaultWriteL0SlowdownTrigger        = 8
+	DefaultFilterBaseLg                  = 11
 )
 
 // Cacher is a caching algorithm.
@@ -54,13 +53,11 @@ type CacherFunc struct {
 }
 
 func (f *CacherFunc) New(capacity int) cache.Cacher {
-	if f.NewFunc != nil {
+	if f != nil && f.NewFunc != nil {
 		return f.NewFunc(capacity)
 	}
 	return nil
 }
-
-func noCacher(int) cache.Cacher { return nil }
 
 var (
 	// LRUCacher is the LRU-cache algorithm.
@@ -158,6 +155,12 @@ type Options struct {
 	//
 	// The default value is 8MiB.
 	BlockCacheCapacity int
+
+	// BlockCacheEvictRemoved allows enable forced-eviction on cached block belonging
+	// to removed 'sorted table'.
+	//
+	// The default if false.
+	BlockCacheEvictRemoved bool
 
 	// BlockRestartInterval is the number of keys between restart points for
 	// delta encoding of keys.
@@ -266,6 +269,21 @@ type Options struct {
 	// The default value is false.
 	DisableCompactionBackoff bool
 
+	// DisableLargeBatchTransaction allows disabling switch-to-transaction mode
+	// on large batch write. If enable batch writes large than WriteBuffer will
+	// use transaction.
+	//
+	// The default is false.
+	DisableLargeBatchTransaction bool
+
+	// DisableSeeksCompaction allows disabling 'seeks triggered compaction'.
+	// The purpose of 'seeks triggered compaction' is to optimize database so
+	// that 'level seeks' can be minimized, however this might generate many
+	// small compaction which may not preferable.
+	//
+	// The default is false.
+	DisableSeeksCompaction bool
+
 	// ErrorIfExist defines whether an error should returned if the DB already
 	// exist.
 	//
@@ -297,27 +315,21 @@ type Options struct {
 	// IteratorSamplingRate defines approximate gap (in bytes) between read
 	// sampling of an iterator. The samples will be used to determine when
 	// compaction should be triggered.
+	// Use negative value to disable iterator sampling.
+	// The iterator sampling is disabled if DisableSeeksCompaction is true.
 	//
 	// The default is 1MiB.
 	IteratorSamplingRate int
-
-	// MaxMemCompationLevel defines maximum level a newly compacted 'memdb'
-	// will be pushed into if doesn't creates overlap. This should less than
-	// NumLevel. Use -1 for level-0.
-	//
-	// The default is 2.
-	MaxMemCompationLevel int
 
 	// NoSync allows completely disable fsync.
 	//
 	// The default is false.
 	NoSync bool
 
-	// NumLevel defines number of database level. The level shouldn't changed
-	// between opens, or the database will panic.
+	// NoWriteMerge allows disabling write merge.
 	//
-	// The default is 7.
-	NumLevel int
+	// The default is false.
+	NoWriteMerge bool
 
 	// OpenFilesCacher provides cache algorithm for open files caching.
 	// Specify NoCacher to disable caching algorithm.
@@ -328,7 +340,7 @@ type Options struct {
 	// OpenFilesCacheCapacity defines the capacity of the open files caching.
 	// Use -1 for zero, this has same effect as specifying NoCacher to OpenFilesCacher.
 	//
-	// The default value is 500.
+	// The default value is 200 on MacOS and 500 on other.
 	OpenFilesCacheCapacity int
 
 	// If true then opens DB in read-only mode.
@@ -359,6 +371,11 @@ type Options struct {
 	//
 	// The default value is 8.
 	WriteL0SlowdownTrigger int
+
+	// FilterBaseLg is the log size for filter block to create a bloom filter.
+	//
+	// The default value is 11(as well as 2KB)
+	FilterBaseLg int
 }
 
 func (o *Options) GetAltFilters() []filter.Filter {
@@ -371,8 +388,6 @@ func (o *Options) GetAltFilters() []filter.Filter {
 func (o *Options) GetBlockCacher() Cacher {
 	if o == nil || o.BlockCacher == nil {
 		return DefaultBlockCacher
-	} else if o.BlockCacher == NoCacher {
-		return nil
 	}
 	return o.BlockCacher
 }
@@ -384,6 +399,13 @@ func (o *Options) GetBlockCacheCapacity() int {
 		return 0
 	}
 	return o.BlockCacheCapacity
+}
+
+func (o *Options) GetBlockCacheEvictRemoved() bool {
+	if o == nil {
+		return false
+	}
+	return o.BlockCacheEvictRemoved
 }
 
 func (o *Options) GetBlockRestartInterval() int {
@@ -440,7 +462,7 @@ func (o *Options) GetCompactionTableSize(level int) int {
 		if o.CompactionTableSize > 0 {
 			base = o.CompactionTableSize
 		}
-		if len(o.CompactionTableSizeMultiplierPerLevel) > level && o.CompactionTableSizeMultiplierPerLevel[level] > 0 {
+		if level < len(o.CompactionTableSizeMultiplierPerLevel) && o.CompactionTableSizeMultiplierPerLevel[level] > 0 {
 			mult = o.CompactionTableSizeMultiplierPerLevel[level]
 		} else if o.CompactionTableSizeMultiplier > 0 {
 			mult = math.Pow(o.CompactionTableSizeMultiplier, float64(level))
@@ -461,7 +483,7 @@ func (o *Options) GetCompactionTotalSize(level int) int64 {
 		if o.CompactionTotalSize > 0 {
 			base = o.CompactionTotalSize
 		}
-		if len(o.CompactionTotalSizeMultiplierPerLevel) > level && o.CompactionTotalSizeMultiplierPerLevel[level] > 0 {
+		if level < len(o.CompactionTotalSizeMultiplierPerLevel) && o.CompactionTotalSizeMultiplierPerLevel[level] > 0 {
 			mult = o.CompactionTotalSizeMultiplierPerLevel[level]
 		} else if o.CompactionTotalSizeMultiplier > 0 {
 			mult = math.Pow(o.CompactionTotalSizeMultiplier, float64(level))
@@ -508,6 +530,20 @@ func (o *Options) GetDisableCompactionBackoff() bool {
 	return o.DisableCompactionBackoff
 }
 
+func (o *Options) GetDisableLargeBatchTransaction() bool {
+	if o == nil {
+		return false
+	}
+	return o.DisableLargeBatchTransaction
+}
+
+func (o *Options) GetDisableSeeksCompaction() bool {
+	if o == nil {
+		return false
+	}
+	return o.DisableSeeksCompaction
+}
+
 func (o *Options) GetErrorIfExist() bool {
 	if o == nil {
 		return false
@@ -530,25 +566,12 @@ func (o *Options) GetFilter() filter.Filter {
 }
 
 func (o *Options) GetIteratorSamplingRate() int {
-	if o == nil || o.IteratorSamplingRate <= 0 {
+	if o == nil || o.IteratorSamplingRate == 0 {
 		return DefaultIteratorSamplingRate
+	} else if o.IteratorSamplingRate < 0 {
+		return 0
 	}
 	return o.IteratorSamplingRate
-}
-
-func (o *Options) GetMaxMemCompationLevel() int {
-	level := DefaultMaxMemCompationLevel
-	if o != nil {
-		if o.MaxMemCompationLevel > 0 {
-			level = o.MaxMemCompationLevel
-		} else if o.MaxMemCompationLevel < 0 {
-			level = 0
-		}
-	}
-	if level >= o.GetNumLevel() {
-		return o.GetNumLevel() - 1
-	}
-	return level
 }
 
 func (o *Options) GetNoSync() bool {
@@ -558,19 +581,16 @@ func (o *Options) GetNoSync() bool {
 	return o.NoSync
 }
 
-func (o *Options) GetNumLevel() int {
-	if o == nil || o.NumLevel <= 0 {
-		return DefaultNumLevel
+func (o *Options) GetNoWriteMerge() bool {
+	if o == nil {
+		return false
 	}
-	return o.NumLevel
+	return o.NoWriteMerge
 }
 
 func (o *Options) GetOpenFilesCacher() Cacher {
 	if o == nil || o.OpenFilesCacher == nil {
 		return DefaultOpenFilesCacher
-	}
-	if o.OpenFilesCacher == NoCacher {
-		return nil
 	}
 	return o.OpenFilesCacher
 }
@@ -619,6 +639,13 @@ func (o *Options) GetWriteL0SlowdownTrigger() int {
 	return o.WriteL0SlowdownTrigger
 }
 
+func (o *Options) GetFilterBaseLg() int {
+	if o == nil || o.FilterBaseLg <= 0 {
+		return DefaultFilterBaseLg
+	}
+	return o.FilterBaseLg
+}
+
 // ReadOptions holds the optional parameters for 'read operation'. The
 // 'read operation' includes Get, Find and NewIterator.
 type ReadOptions struct {
@@ -651,6 +678,11 @@ func (ro *ReadOptions) GetStrict(strict Strict) bool {
 // WriteOptions holds the optional parameters for 'write operation'. The
 // 'write operation' includes Write, Put and Delete.
 type WriteOptions struct {
+	// NoWriteMerge allows disabling write merge.
+	//
+	// The default is false.
+	NoWriteMerge bool
+
 	// Sync is whether to sync underlying writes from the OS buffer cache
 	// through to actual disk, if applicable. Setting Sync can result in
 	// slower writes.
@@ -664,6 +696,13 @@ type WriteOptions struct {
 	//
 	// The default value is false.
 	Sync bool
+}
+
+func (wo *WriteOptions) GetNoWriteMerge() bool {
+	if wo == nil {
+		return false
+	}
+	return wo.NoWriteMerge
 }
 
 func (wo *WriteOptions) GetSync() bool {
